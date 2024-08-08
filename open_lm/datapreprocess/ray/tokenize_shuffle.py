@@ -604,7 +604,7 @@ def main(args):
         ray.init(
             args.ray_address,
             runtime_env=runtime_env,
-            _temp_dir=args.ray_spill_location,
+            # _temp_dir=args.ray_spill_location,
             dashboard_host=args.ray_dashboard_host,
         )
     num_nodes = len(ray.nodes())
