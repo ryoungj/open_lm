@@ -687,7 +687,7 @@ def main(args):
         ds = ds.repartition(1)
         ds = ds.sort(key="shard")
         jsonl_lines = ds.take_all()
-        token_count_from_manifest = sum([x["num_sequences"][0] for x in jsonl_lines] * seqlen)
+        token_count_from_manifest = sum([x["num_sequences"] for x in jsonl_lines] * seqlen)
         write_manifest(jsonl_lines, args)
     else:
         write_status = ds.map_batches(
