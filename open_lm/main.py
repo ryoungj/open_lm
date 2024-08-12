@@ -289,7 +289,7 @@ def save_checkpoint(
                     path,
                 )
 
-        if args.delete_previous_checkpoint:
+        if args.delete_previous_checkpoint and not failed:
             for prefix in prefixes:
                 prev = os.path.join(args.checkpoint_path, f"{prefix}{completed_epoch - 1}.pt")
                 if os.path.exists(prev):
