@@ -253,8 +253,10 @@ def log_num_checkpoints(total_steps, args):
         logging.info("Precounting number of steps / tokens seen per checkpoint:")
 
     while steps_done < total_steps:
+        samples_needed = min(args.train_num_samples, (total_steps - steps_done) * args.global_batch_size)
+
         _, num_samples_per_source, next_shard_per_source = get_string_for_epoch(
-            args.train_num_samples,
+            samples_needed,
             next_shard_per_source,
             args.dataset_manifest,
             args.train_data_mix_weights,
