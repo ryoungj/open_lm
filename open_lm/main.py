@@ -95,8 +95,14 @@ def get_state_dict(name):
     checkpoint = pt_load(name, map_location="cpu")
     if "epoch" in checkpoint:
         sd = checkpoint["state_dict"]
-        if next(iter(sd.items()))[0].startswith("module"):
-            sd = {k[len("module.") :]: v for k, v in sd.items()}
+        while True:
+            first_key = next(iter(sd.items()))[0]
+            if first_key.startswith("module"):
+                sd = {k[len("module."):]: v for k, v in sd.items()}
+            elif "_orig_mod" in first_key:
+                sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+            else:
+                break
     else:
         sd = checkpoint
     return sd
@@ -122,10 +128,16 @@ def load_model(args, model, different_seed=False):
         start_epoch = checkpoint["epoch"]
         sd = checkpoint["state_dict"]
         global_step = checkpoint.get("step", None)
-        if next(iter(sd.items()))[0].startswith("module"):
-            sd = {k[len("module.") :]: v for k, v in sd.items()}
-        if "_orig_mod" in next(iter(sd.items()))[0]:
-            sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+
+        while True:
+            first_key = next(iter(sd.items()))[0]
+            if first_key.startswith("module"):
+                sd = {k[len("module."):]: v for k, v in sd.items()}
+            elif "_orig_mod" in first_key:
+                sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+            else:
+                break
+        
         if args.fsdp:
             model.load_state_dict(sd)
         elif args.distributed:
@@ -150,10 +162,14 @@ def load_avg_models(args, averagers):
         if averagers is not None:
             for k in averagers.avgs_dict:
                 avg_sd = torch.load(args.resume.replace("epoch", k), map_location="cpu")
-                if next(iter(avg_sd.items()))[0].startswith("module"):
-                    avg_sd = {k[len("module.") :]: v for k, v in avg_sd.items()}
-                if "_orig_mod" in next(iter(avg_sd.items()))[0]:
-                    avg_sd = {k.replace("_orig_mod.", ""): v for k, v in avg_sd.items()}
+                while True:
+                    first_key = next(iter(avg_sd.items()))[0]
+                    if first_key.startswith("module"):
+                        avg_sd = {k[len("module.") :]: v for k, v in avg_sd.items()}
+                    elif "_orig_mod" in first_key:
+                        avg_sd = {k.replace("_orig_mod.", ""): v for k, v in avg_sd.items()}
+                    else:
+                        break
                 averagers.avgs_dict[k].load_state_dict_avg(avg_sd)
                 logging.info(
                     f"=> resuming averager for {k} from checkpoint '{args.resume.replace('epoch', k)} (epoch {start_epoch})"
