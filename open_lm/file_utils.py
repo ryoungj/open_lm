@@ -13,7 +13,7 @@ import fsspec
 import numpy as np
 import torch
 
-from typing import List, Optional
+from typing import List, Optional, Union
 from tqdm import tqdm
 
 from open_lm.distributed import is_master
@@ -255,7 +255,7 @@ def log_num_checkpoints(total_steps, args):
     while steps_done < total_steps:
         samples_needed = min(args.train_num_samples, (total_steps - steps_done) * args.global_batch_size)
 
-        _, num_samples_per_source, next_shard_per_source = get_string_for_epoch(
+        shard_strings_per_source, num_samples_per_source, next_shard_per_source = get_string_for_epoch(
             samples_needed,
             next_shard_per_source,
             args.dataset_manifest,
@@ -276,6 +276,7 @@ def log_num_checkpoints(total_steps, args):
 
         if is_master(args):
             logging.info(f"==> Checkpoint {checkpoints_made}, steps {steps_done}, tokens seen {tokens_seen}")
+            logging.info(f"==> Train on {shard_strings_per_source}")
 
     if is_master(args):
         logging.info(
@@ -313,7 +314,6 @@ def get_string_for_epoch(
             num_samples, starting_points, paths, weights, num_workers_per_gpu, world_size, shard_shuffle_seed
         )
 
-
 def _multi_epoch_string(
     num_samples: int,
     starting_shard_per_source: List[int],
@@ -321,47 +321,68 @@ def _multi_epoch_string(
     weights: Optional[List[float]],
     num_workers_per_gpu: int,
     world_size: int,
-    shard_shuffle_seed: Optional[int],
+    shard_shuffle_seed: Optional[Union[int, List[int]]],
 ):
     """Return the string for training the shards, while allowing multiple passes over the dataset."""
 
     num_sources = len(paths)
     total_shards_per_source = [len(get_metadata_file(p, shard_shuffle_seed=None)) for p in paths]
-    pass_idx = starting_shard_per_source[0] // total_shards_per_source[0]
+    if not isinstance(shard_shuffle_seed, list):
+        shard_shuffle_seed = [shard_shuffle_seed] * num_sources
+    
+    pass_idx_per_source = [starting_shard_per_source[i] // total_shards_per_source[i] for i in range(num_sources)]
 
-    assert all(
-        [starting_shard_per_source[i] // total_shards_per_source[i] == pass_idx for i in range(num_sources)]
-    ), "Passes across sources are not synced."
+    # assert all(
+    #     [starting_shard_per_source[i] // total_shards_per_source[i] == pass_idx for i in range(num_sources)]
+    # ), "Passes across sources are not synced."
 
-    retries = 3
+    collected_shard_strings_per_source = [[] for _ in range(num_sources)]
+    collected_num_samples_per_source = [0 for _ in range(num_sources)]
+    collected_next_shard_per_source = starting_shard_per_source
 
-    while retries > 0:
-        try:
-            starting_shard_per_source_single = [
-                starting_shard_per_source[i] % total_shards_per_source[i] for i in range(num_sources)
-            ]
-            shard_strings_per_source, num_samples_per_source, next_shard_per_source = _single_epoch_string(
-                num_samples=num_samples,
-                starting_shard_per_source=starting_shard_per_source_single,
-                paths=paths,
-                weights=weights,
-                num_workers_per_gpu=num_workers_per_gpu,
-                world_size=world_size,
-                shard_shuffle_seed=shard_shuffle_seed + pass_idx if shard_shuffle_seed is not None else None,
-            )
-            next_shard_per_source = [
-                next_shard_per_source[i] + pass_idx * total_shards_per_source[i] for i in range(num_sources)
-            ]
-            return shard_strings_per_source, num_samples_per_source, next_shard_per_source
-        except IndexError as e:
-            # In this case, we have run out of shards for this pass, so we will start a new pass of our dataset.
-            pass_idx += 1
-            starting_shard_per_source = [pass_idx * total_shards_per_source[i] for i in range(num_sources)]
-            retries -= 1
+    while True:
+        starting_shard_per_source_single = [
+            collected_next_shard_per_source[i] % total_shards_per_source[i] for i in range(num_sources)
+        ]
+        shard_shuffle_seed_single = [shard_shuffle_seed[i] + pass_idx_per_source[i] if shard_shuffle_seed[i] is not None else None for i in range(num_sources)]
+        shard_strings_per_source, num_samples_per_source, next_shard_per_source = _single_epoch_string(
+            num_samples=num_samples,
+            starting_shard_per_source=starting_shard_per_source_single,
+            paths=paths,
+            weights=weights,
+            num_workers_per_gpu=num_workers_per_gpu,
+            world_size=world_size,
+            shard_shuffle_seed=shard_shuffle_seed_single,
+            raise_on_error=False,
+            show_warning=False,
+        )
 
-    raise ValueError(
-        "Multiple passes over the dataset did not allow for a valid shard string to be created. Try decreasing the number of tokens between checkpoints."
-    )
+        for i in range(num_sources):
+            collected_shard_strings_per_source[i].append(shard_strings_per_source[i])
+            collected_num_samples_per_source[i] += num_samples_per_source[i]
+        
+        collected_next_shard_per_source = [
+            next_shard_per_source[i] + pass_idx_per_source[i] * total_shards_per_source[i] for i in range(num_sources)
+        ]
+
+        collected_num_samples = sum(num_samples_per_source)
+        if collected_num_samples >= num_samples:  # enough samples collected
+            break
+        else:
+            num_samples -= collected_num_samples
+
+            oos_source_indices = []
+            for i in range(num_sources):
+                if next_shard_per_source[i] >= total_shards_per_source[i]:
+                    oos_source_indices.append(i)
+
+                    pass_idx_per_source[i] += 1
+                    collected_next_shard_per_source[i] = pass_idx_per_source[i] * total_shards_per_source[i]
+                    logging.info(f"Source {i} ran out of shards. Moving to next pass.")
+
+            assert len(oos_source_indices) > 0, "Could not determine which source ran out of shards."
+
+    return merge_shard_strings(collected_shard_strings_per_source), collected_num_samples_per_source, collected_next_shard_per_source
 
 
 def _single_epoch_string(
@@ -371,7 +392,9 @@ def _single_epoch_string(
     weights: Optional[List[float]],
     num_workers_per_gpu: int,
     world_size: int,
-    shard_shuffle_seed: Optional[int],
+    shard_shuffle_seed: Optional[Union[int, List[int]]],
+    raise_on_error: bool = True,
+    show_warning: bool = True,
 ):
     """Retrieve shards to train on for a particular checkpoint.
 
@@ -385,31 +408,30 @@ def _single_epoch_string(
         num_workers_per_gpu: Number of workers per gpu process.
         world_size: Total number of gpus used for training.
         shard_shuffle_seed: Seed to shuffle shards before checkpoint assignment
+        raise_on_error: Whether to raise an error when the number of shards is not enough.
+        show_warning: Whether to show warnings.
     """
 
     num_sources = len(paths)
 
     if num_sources > 1:
-        logging.warning(
-            "Multiple sources are not supported fully as of now. It is advised to combine the data into a single "
-            "source, by using datapreprocess/ray/tokenize_shuffle.py. Best effort will be done to mix data at the "
-            "desired ratio."
-        )
         if are_sources_imbalanced_with_each_other(paths):
-            logging.warning(
-                "Sources contain highly imbalanced shards (largest median shard size of a source is >2x the smallest "
-                "median size of a source). This will lead to deteriorated performance (less frequent checkpoints, "
-                "data being skipped, and inaccurate mixing). It is STRONGLY advised to combine into one source."
+            if show_warning:
+                logging.warning(
+                    "Sources contain highly imbalanced shards (largest median shard size of a source is >2x the smallest "
+                    "median size of a source). This will lead to deteriorated performance (less frequent checkpoints, "
+                    "data being skipped, and inaccurate mixing). It is STRONGLY advised to combine into one source."
             )
 
     for path in paths:
         num_small_shards = count_small_shards(path)
         if num_small_shards > 0:
-            logging.warning(
-                f"Source defined by {path} contains {num_small_shards} shards that are smaller than 90% the size of "
-                f"the largest shard. These shards might cause deterioration in performance, with more samples being "
-                f"skipped than necessary. It is advised to make the shards more uniform."
-            )
+            if show_warning:
+                logging.warning(
+                    f"Source defined by {path} contains {num_small_shards} shards that are smaller than 90% the size of "
+                    f"the largest shard. These shards might cause deterioration in performance, with more samples being "
+                    f"skipped than necessary. It is advised to make the shards more uniform."
+                )
 
     if weights is None:
         weights = [1.0 / num_sources for _ in range(num_sources)]
@@ -418,7 +440,10 @@ def _single_epoch_string(
 
     needed_samples_per_source = [int(np.ceil(weights[i] * num_samples / sum(weights))) for i in range(num_sources)]
 
-    manifests = [get_metadata_file(path, shard_shuffle_seed=shard_shuffle_seed) for path in paths]
+    if not isinstance(shard_shuffle_seed, list):    
+        shard_shuffle_seed = [shard_shuffle_seed] * num_sources
+
+    manifests = [get_metadata_file(path, shard_shuffle_seed=shard_shuffle_seed[i]) for i, path in enumerate(paths)]
 
     shard_strings_per_source = []
     next_shard_per_source = copy.deepcopy(starting_shard_per_source)
@@ -426,11 +451,19 @@ def _single_epoch_string(
     num_samples_per_source = [[] for _ in range(num_sources)]
 
     total_num_workers = num_workers_per_gpu * world_size
-    while not enough_shards(shard_list_per_source, total_num_workers) or not enough_samples(
-        num_samples_per_source, needed_samples_per_source
-    ):
-        try:
-            for i in range(num_sources):
+    shard_list_out_of_shards = [False] * num_sources
+    shard_finished = [False] * num_sources
+
+    while True:
+        if all(shard_finished):
+            break
+
+        for i in range(num_sources):
+            if (enough_shards(shard_list_per_source[i:i+1], total_num_workers) and enough_samples(num_samples_per_source[i:i+1], needed_samples_per_source[i:i+1])) or shard_list_out_of_shards[i]:
+                shard_finished[i] = True
+                continue
+
+            try:
                 # Add shards incrementally
                 shard_name = manifests[i][next_shard_per_source[i]]["shard"]
                 try:
@@ -443,16 +476,20 @@ def _single_epoch_string(
 
                 next_shard_per_source[i] += 1
 
-        except IndexError as e:
-            logging.error(
-                "Number of shards requested for a single epoch is more than the number of shards available. This means "
-                "that the amount of data requested to train on is more than the dataloader can serve. This can either "
-                "happen because there are not enough data to begin with, or data being skipped due to rounding errors. "
-                "To alleviate the latter, consider making more uniform shards, and using less workers/GPUs. This will "
-                "allow for better use of the dataset."
-            )
-            raise e
-
+            except IndexError as e:
+                if raise_on_error:
+                    logging.error(
+                        "Number of shards requested for a single epoch is more than the number of shards available. This means "
+                        "that the amount of data requested to train on is more than the dataloader can serve. This can either "
+                        "happen because there are not enough data to begin with, or data being skipped due to rounding errors. "
+                        "To alleviate the latter, consider making more uniform shards, and using less workers/GPUs. This will "
+                        "allow for better use of the dataset."
+                    )
+                    raise IndexError(f"Source idx {i} runs out of shards.")
+                else:
+                    shard_list_out_of_shards[i] = True
+                    # return the partial shard strings
+            
     for i in range(num_sources):
         # Ensure the number of shards is a multiple of number of workers, so each worker has the same
         # number of shards.
@@ -483,3 +520,37 @@ def _single_epoch_string(
         shard_strings_per_source.append(shard_string_source)
 
     return shard_strings_per_source, num_samples_per_source, next_shard_per_source
+
+
+def merge_shard_strings(shard_strings_per_source):
+    """Merge shard strings from multiple sources into a single shard string."""
+    merged_shard_strings = []
+    for shard_strings in shard_strings_per_source:
+        if len(shard_strings) == 1:
+            merged_shard_strings.append(shard_strings[0])
+        else:
+            is_s3 = shard_strings[0].startswith("pipe:aws s3 cp ")
+            if is_s3:
+                shard_root = " ".join(shard_strings[0].split(" ")[:-1]) + " "
+                shard_list = [item.split(" ")[-1] for item in shard_strings]
+            else:
+                shard_root = "/".join(shard_strings[0].split("/")[:-1]) + "/"
+                shard_list = [item.split("/")[-1] for item in shard_strings]
+            
+            # Extract shard names without file extension
+            shard_names = [item.split(".")[0].strip("{}").split(",") for item in shard_list]
+            shard_names = [item for sublist in shard_names for item in sublist]  # Flatten the list
+            
+            # Get the file extension from the first shard
+            file_ext = "." + shard_list[0].split(".")[-1] if "." in shard_list[0] else ""
+            
+            if len(shard_names) == 1:
+                merged_shard = shard_root + shard_names[0] + file_ext
+            else:
+                merged_shard = shard_root + "{" + ",".join(shard_names) + "}" + file_ext
+            if is_s3:
+                merged_shard = f"pipe:aws s3 cp {merged_shard} -"
+            merged_shard_strings.append(merged_shard)
+
+    return merged_shard_strings
+
