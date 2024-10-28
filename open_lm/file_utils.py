@@ -306,13 +306,15 @@ def get_string_for_epoch(
 ):
     """See _single_epoch_string for full docstring."""
     if multi_epoch:
-        return _multi_epoch_string(
+        shard_strings_per_source, num_samples_per_source, next_shard_per_source = _multi_epoch_string(
             num_samples, starting_points, paths, weights, num_workers_per_gpu, world_size, shard_shuffle_seed
         )
     else:
-        return _single_epoch_string(
+        shard_strings_per_source, num_samples_per_source, next_shard_per_source, _ = _single_epoch_string(
             num_samples, starting_points, paths, weights, num_workers_per_gpu, world_size, shard_shuffle_seed
         )
+
+    return shard_strings_per_source, num_samples_per_source, next_shard_per_source
 
 def _multi_epoch_string(
     num_samples: int,
@@ -345,7 +347,7 @@ def _multi_epoch_string(
             collected_next_shard_per_source[i] % total_shards_per_source[i] for i in range(num_sources)
         ]
         shard_shuffle_seed_single = [shard_shuffle_seed[i] + pass_idx_per_source[i] if shard_shuffle_seed[i] is not None else None for i in range(num_sources)]
-        shard_strings_per_source, num_samples_per_source, next_shard_per_source = _single_epoch_string(
+        shard_strings_per_source, num_samples_per_source, next_shard_per_source, shard_list_out_of_shards = _single_epoch_string(
             num_samples=num_samples,
             starting_shard_per_source=starting_shard_per_source_single,
             paths=paths,
@@ -371,16 +373,13 @@ def _multi_epoch_string(
         else:
             num_samples -= collected_num_samples
 
-            oos_source_indices = []
             for i in range(num_sources):
-                if next_shard_per_source[i] >= total_shards_per_source[i]:
-                    oos_source_indices.append(i)
-
+                if shard_list_out_of_shards[i]:
                     pass_idx_per_source[i] += 1
                     collected_next_shard_per_source[i] = pass_idx_per_source[i] * total_shards_per_source[i]
-                    logging.info(f"Source {i} ran out of shards. Moving to next pass.")
+                    logging.info(f"Source {i} ran out of shards. Moving to next pass {pass_idx_per_source[i] + 1}.")
 
-            assert len(oos_source_indices) > 0, "Could not determine which source ran out of shards."
+            # assert len(oos_source_indices) > 0, "Could not determine which source ran out of shards."
 
     return merge_shard_strings(collected_shard_strings_per_source), collected_num_samples_per_source, collected_next_shard_per_source
 
@@ -505,6 +504,10 @@ def _single_epoch_string(
         # Put back unused shards.
         next_shard_per_source[i] = starting_shard_per_source[i] + len(shard_list_per_source[i])
 
+        if (not shard_list_out_of_shards[i]) and num_multiples == 0:
+            logging.warning(f"Source {i} has no shards after rounding to the nearest multiple of the number of workers.")
+            shard_list_out_of_shards[i] = True
+
     num_samples_per_source = [sum(n) for n in num_samples_per_source]
 
     for i, source_path in enumerate(paths):
@@ -519,7 +522,7 @@ def _single_epoch_string(
             shard_string_source = f"pipe:aws s3 cp {shard_string_source} -"
         shard_strings_per_source.append(shard_string_source)
 
-    return shard_strings_per_source, num_samples_per_source, next_shard_per_source
+    return shard_strings_per_source, num_samples_per_source, next_shard_per_source, shard_list_out_of_shards
 
 
 def merge_shard_strings(shard_strings_per_source):
