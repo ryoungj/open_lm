@@ -274,9 +274,12 @@ def log_num_checkpoints(total_steps, args):
         tokens_seen = steps_done * args.global_batch_size * args.seq_len
         checkpoints_made += 1
 
+        sample_ratios = [n / sum(num_samples_per_source) for n in num_samples_per_source]
+
         if is_master(args):
             logging.info(f"==> Checkpoint {checkpoints_made}, steps {steps_done}, tokens seen {tokens_seen}")
             logging.info(f"==> Train on {shard_strings_per_source}")
+            logging.info(f"==> Num samples per source: {num_samples_per_source}, ratios: {sample_ratios}")
 
     if is_master(args):
         logging.info(
@@ -305,28 +308,35 @@ def get_string_for_epoch(
     shard_shuffle_seed=None,
 ):
     """See _single_epoch_string for full docstring."""
+
+    num_sources = len(paths)
+    if weights is None:
+        weights = [1.0 / num_sources for _ in range(num_sources)]
+
+    assert len(weights) == num_sources, "One weight is needed per source."
+
+    needed_samples_per_source = [int(np.ceil(weights[i] * num_samples / sum(weights))) for i in range(num_sources)]
+
     if multi_epoch:
         shard_strings_per_source, num_samples_per_source, next_shard_per_source = _multi_epoch_string(
-            num_samples, starting_points, paths, weights, num_workers_per_gpu, world_size, shard_shuffle_seed
+            needed_samples_per_source, starting_points, paths, num_workers_per_gpu, world_size, shard_shuffle_seed
         )
     else:
         shard_strings_per_source, num_samples_per_source, next_shard_per_source, _ = _single_epoch_string(
-            num_samples, starting_points, paths, weights, num_workers_per_gpu, world_size, shard_shuffle_seed
+            needed_samples_per_source, starting_points, paths, num_workers_per_gpu, world_size, shard_shuffle_seed
         )
 
     return shard_strings_per_source, num_samples_per_source, next_shard_per_source
 
 def _multi_epoch_string(
-    num_samples: int,
+    needed_samples_per_source: List[int],
     starting_shard_per_source: List[int],
     paths: List[str],
-    weights: Optional[List[float]],
     num_workers_per_gpu: int,
     world_size: int,
     shard_shuffle_seed: Optional[Union[int, List[int]]],
 ):
     """Return the string for training the shards, while allowing multiple passes over the dataset."""
-
     num_sources = len(paths)
     total_shards_per_source = [len(get_metadata_file(p, shard_shuffle_seed=None)) for p in paths]
     if not isinstance(shard_shuffle_seed, list):
@@ -341,6 +351,7 @@ def _multi_epoch_string(
     collected_shard_strings_per_source = [[] for _ in range(num_sources)]
     collected_num_samples_per_source = [0 for _ in range(num_sources)]
     collected_next_shard_per_source = starting_shard_per_source
+    cur_needed_samples_per_source = copy.deepcopy(needed_samples_per_source)
 
     while True:
         starting_shard_per_source_single = [
@@ -348,10 +359,9 @@ def _multi_epoch_string(
         ]
         shard_shuffle_seed_single = [shard_shuffle_seed[i] + pass_idx_per_source[i] if shard_shuffle_seed[i] is not None else None for i in range(num_sources)]
         shard_strings_per_source, num_samples_per_source, next_shard_per_source, shard_list_out_of_shards = _single_epoch_string(
-            num_samples=num_samples,
+            needed_samples_per_source=cur_needed_samples_per_source,
             starting_shard_per_source=starting_shard_per_source_single,
             paths=paths,
-            weights=weights,
             num_workers_per_gpu=num_workers_per_gpu,
             world_size=world_size,
             shard_shuffle_seed=shard_shuffle_seed_single,
@@ -362,17 +372,15 @@ def _multi_epoch_string(
         for i in range(num_sources):
             collected_shard_strings_per_source[i].append(shard_strings_per_source[i])
             collected_num_samples_per_source[i] += num_samples_per_source[i]
+            cur_needed_samples_per_source[i] = max(0, cur_needed_samples_per_source[i] - num_samples_per_source[i])
         
         collected_next_shard_per_source = [
             next_shard_per_source[i] + pass_idx_per_source[i] * total_shards_per_source[i] for i in range(num_sources)
         ]
 
-        collected_num_samples = sum(num_samples_per_source)
-        if collected_num_samples >= num_samples:  # enough samples collected
+        if all([n == 0 for n in cur_needed_samples_per_source]):  # enough samples collected
             break
         else:
-            num_samples -= collected_num_samples
-
             for i in range(num_sources):
                 if shard_list_out_of_shards[i]:
                     pass_idx_per_source[i] += 1
@@ -380,15 +388,14 @@ def _multi_epoch_string(
                     logging.info(f"Source {i} ran out of shards. Moving to next pass {pass_idx_per_source[i] + 1}.")
 
             # assert len(oos_source_indices) > 0, "Could not determine which source ran out of shards."
-
+    
     return merge_shard_strings(collected_shard_strings_per_source), collected_num_samples_per_source, collected_next_shard_per_source
 
 
 def _single_epoch_string(
-    num_samples: int,
+    needed_samples_per_source: List[int],
     starting_shard_per_source: List[int],
     paths: List[str],
-    weights: Optional[List[float]],
     num_workers_per_gpu: int,
     world_size: int,
     shard_shuffle_seed: Optional[Union[int, List[int]]],
@@ -403,7 +410,7 @@ def _single_epoch_string(
         num_samples: Total number of samples required.
         starting_shard_per_source: First shard per source that has not been consumed yet.
         paths: Paths to source manifests.
-        weights: Weighting between sources. If None, it is assumed to be uniform.
+        needed_samples_per_source: Number of samples needed per source.
         num_workers_per_gpu: Number of workers per gpu process.
         world_size: Total number of gpus used for training.
         shard_shuffle_seed: Seed to shuffle shards before checkpoint assignment
@@ -432,13 +439,6 @@ def _single_epoch_string(
                     f"skipped than necessary. It is advised to make the shards more uniform."
                 )
 
-    if weights is None:
-        weights = [1.0 / num_sources for _ in range(num_sources)]
-
-    assert len(weights) == num_sources, "One weight is needed per source."
-
-    needed_samples_per_source = [int(np.ceil(weights[i] * num_samples / sum(weights))) for i in range(num_sources)]
-
     if not isinstance(shard_shuffle_seed, list):    
         shard_shuffle_seed = [shard_shuffle_seed] * num_sources
 
@@ -458,7 +458,7 @@ def _single_epoch_string(
             break
 
         for i in range(num_sources):
-            if (enough_shards(shard_list_per_source[i:i+1], total_num_workers) and enough_samples(num_samples_per_source[i:i+1], needed_samples_per_source[i:i+1])) or shard_list_out_of_shards[i]:
+            if needed_samples_per_source[i] == 0 or (enough_shards(shard_list_per_source[i:i+1], total_num_workers) and enough_samples(num_samples_per_source[i:i+1], needed_samples_per_source[i:i+1])) or shard_list_out_of_shards[i]:
                 shard_finished[i] = True
                 continue
 
@@ -543,6 +543,7 @@ def merge_shard_strings(shard_strings_per_source):
             # Extract shard names without file extension
             shard_names = [item.split(".")[0].strip("{}").split(",") for item in shard_list]
             shard_names = [item for sublist in shard_names for item in sublist]  # Flatten the list
+            shard_names = [item for item in shard_names if item != ""]
             
             # Get the file extension from the first shard
             file_ext = "." + shard_list[0].split(".")[-1] if "." in shard_list[0] else ""
