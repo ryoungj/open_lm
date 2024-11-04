@@ -24,7 +24,8 @@ class HfWrapper(nn.Module):
             self.model.gradient_checkpointing_disable()
 
     def forward(self, input):
-        return self.model(input_ids=input)[0], None
+        outputs = self.model(input_ids=input)
+        return outputs.logits, None, None
 
 
 def create_wrapped_hf_model(hf_model_name):

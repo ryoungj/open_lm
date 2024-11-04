@@ -133,6 +133,8 @@ def load_model(args, model, different_seed=False):
             first_key = next(iter(sd.items()))[0]
             if first_key.startswith("module"):
                 sd = {k[len("module."):]: v for k, v in sd.items()}
+            elif first_key.startswith("model"):
+                sd = {k[len("model."):]: v for k, v in sd.items()}
             elif "_orig_mod" in first_key:
                 sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
             else:
