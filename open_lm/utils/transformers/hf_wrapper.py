@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
+from open_lm.hf import *
 
 
 class HfWrapper(nn.Module):
